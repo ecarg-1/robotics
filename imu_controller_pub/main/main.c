@@ -16,6 +16,8 @@
 #include "mpu9250.h"
 #include "driver/i2c.h"
 #include <sensor_msgs/msg/imu.h>
+#include <geometry_msgs/msg/vector3.h>
+#include <math.h>
 
 #ifdef CONFIG_MICRO_ROS_ESP_XRCE_DDS_MIDDLEWARE
 #include <rmw_microros/rmw_microros.h>
@@ -29,8 +31,11 @@
 #define I2C_MASTER_NUM              I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ          400000
 
-rcl_publisher_t publisher;
-sensor_msgs__msg__Imu msg;
+rcl_publisher_t imu_publisher;
+sensor_msgs__msg__Imu imu_msg;
+
+rcl_publisher_t pitch_roll_publisher;
+geometry_msgs__msg__Vector3 vector3_msg;
 
 void timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 {
@@ -38,15 +43,35 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 	if (timer != NULL) {
 		int16_t ax, ay, az, gx, gy, gz, temp;
         mpu9250_read_imu_raw(&ax, &ay, &az, &gx, &gy, &gz, &temp);
-		msg.linear_acceleration.x = ax;
-		msg.linear_acceleration.y = ay;
-		msg.linear_acceleration.z = az;
 
-		msg.angular_velocity.x = gx;
-		msg.angular_velocity.y = gy;
-		msg.angular_velocity.z = gz;
+		//scale aclleration to m/s^2
+		float ax_g = ax * (2.0f / 32768.0f);
+		float ay_g = ay * (2.0f / 32768.0f);
+		float az_g = az * (2.0f / 32768.0f);
 
-		RCSOFTCHECK(rcl_publish(&publisher, &msg, NULL));
+		imu_msg.linear_acceleration.x = ax_g * 9.81f;
+		imu_msg.linear_acceleration.y = ay_g * 9.81f;
+		imu_msg.linear_acceleration.z = az_g * 9.81f;
+
+		//scale gyro to rad/s
+		float gx_r = gx * ((250.0f / 32768.0f) * M_PI/180.0f);
+		float gy_r = gy * ((250.0f / 32768.0f) * M_PI/180.0f);
+		float gz_r = gz * ((250.0f / 32768.0f) * M_PI/180.0f);
+
+		imu_msg.angular_velocity.x = gx_r;
+		imu_msg.angular_velocity.y = gy_r;
+		imu_msg.angular_velocity.z = gz_r;
+
+		//compute pitch + roll
+		float pitch = atan2f(ax_g, sqrtf(ay_g * ay_g + az_g * az_g));
+		float roll  = atan2f(ay_g, sqrtf(ax_g * ax_g + az_g * az_g));
+
+		vector3_msg.z = 0;
+		vector3_msg.x = pitch;
+		vector3_msg.y = roll;
+
+		RCSOFTCHECK(rcl_publish(&imu_publisher, &imu_msg, NULL));
+		RCSOFTCHECK(rcl_publish(&pitch_roll_publisher, &vector3_msg, NULL));
 	}
 }
 
@@ -69,20 +94,28 @@ void micro_ros_task(void * arg)
 	// create init_options
 	RCCHECK(rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator));
 
-	// create node
-	rcl_node_t node;
-	RCCHECK(rclc_node_init_default(&node, "imu_pub_node", "", &support));
+	// create pub_node
+	rcl_node_t pub_node;
+	RCCHECK(rclc_node_init_default(&pub_node, "pub_node", "", &support));
 
-	// create publisher
+	// create imu_publisher
 	RCCHECK(rclc_publisher_init_default(
-		&publisher,
-		&node,
+		&imu_publisher,
+		&pub_node,
 		ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
 		"/imu"));
 
+	//pitch roll publisher
+	RCCHECK(rclc_publisher_init_default(
+		&pitch_roll_publisher,
+		&pub_node,
+		ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Vector3),
+		"/pitch_roll"
+	));
+
 	// create timer,
 	rcl_timer_t timer;
-	const unsigned int timer_timeout = 500;
+	const unsigned int timer_timeout = 20;
 	RCCHECK(rclc_timer_init_default(
 		&timer,
 		&support,
@@ -94,16 +127,17 @@ void micro_ros_task(void * arg)
 	RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
 	RCCHECK(rclc_executor_add_timer(&executor, &timer));
 	
-	sensor_msgs__msg__Imu__init(&msg); //initialize message because there are so many fields
+	sensor_msgs__msg__Imu__init(&imu_msg); //initialize message because there are so many fields
+	vector3_msg.x = vector3_msg.y = vector3_msg.z = 0.0;
 
 	while(1){
-		rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
-		usleep(10000);
+		rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
 	}
 
 	// free resources
-	RCCHECK(rcl_publisher_fini(&publisher, &node));
-	RCCHECK(rcl_node_fini(&node));
+	RCCHECK(rcl_publisher_fini(&imu_publisher, &pub_node));
+	RCCHECK(rcl_publisher_fini(&pitch_roll_publisher, &pub_node));
+	RCCHECK(rcl_node_fini(&pub_node));
 
   	vTaskDelete(NULL);
 }
