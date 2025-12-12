@@ -18,6 +18,7 @@
 #include <sensor_msgs/msg/imu.h>
 #include <geometry_msgs/msg/vector3.h>
 #include <math.h>
+#include "rosidl_runtime_c/string_functions.h"
 
 #ifdef CONFIG_MICRO_ROS_ESP_XRCE_DDS_MIDDLEWARE
 #include <rmw_microros/rmw_microros.h>
@@ -49,6 +50,10 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 		float ay_g = ay * (2.0f / 32768.0f);
 		float az_g = az * (2.0f / 32768.0f);
 
+		int64_t now = rmw_uros_epoch_nanos();
+		imu_msg.header.stamp.sec = now / 1000000000LL;
+		imu_msg.header.stamp.nanosec = now % 1000000000LL;
+
 		imu_msg.linear_acceleration.x = ax_g * 9.81f;
 		imu_msg.linear_acceleration.y = ay_g * 9.81f;
 		imu_msg.linear_acceleration.z = az_g * 9.81f;
@@ -64,11 +69,25 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 
 		//compute pitch + roll
 		float pitch = atan2f(ax_g, sqrtf(ay_g * ay_g + az_g * az_g));
-		float roll  = atan2f(ay_g, sqrtf(ax_g * ax_g + az_g * az_g));
+		float roll  = -atan2f(ay_g, sqrtf(ax_g * ax_g + az_g * az_g));
 
 		vector3_msg.z = 0;
 		vector3_msg.x = pitch;
 		vector3_msg.y = roll;
+
+		//quaternion for RViz from pitch and roll (yaw=0)
+
+		float cy = cosf(0.0);
+		float cp = cosf(pitch * .5f);
+		float cr = cosf(roll * .5f);
+		float sy = sinf(0.0);
+		float sp = sinf(pitch * .5f);
+		float sr = sinf(roll * .5f);
+
+		imu_msg.orientation.w = cr*cp*cy + sr*sp*sy;
+		imu_msg.orientation.x = sr*cp*cy - cr*sp*sy;
+		imu_msg.orientation.y = cr*sp*cy + sr*cp*sy;
+		imu_msg.orientation.z = cr*cp*sy - sr*sp*cy;
 
 		RCSOFTCHECK(rcl_publish(&imu_publisher, &imu_msg, NULL));
 		RCSOFTCHECK(rcl_publish(&pitch_roll_publisher, &vector3_msg, NULL));
@@ -128,6 +147,8 @@ void micro_ros_task(void * arg)
 	RCCHECK(rclc_executor_add_timer(&executor, &timer));
 	
 	sensor_msgs__msg__Imu__init(&imu_msg); //initialize message because there are so many fields
+	rosidl_runtime_c__String__assign(&imu_msg.header.frame_id, "imu_link"); //adding frame id
+	rmw_uros_sync_session(1000);   //sync ESP32 time with agent
 	vector3_msg.x = vector3_msg.y = vector3_msg.z = 0.0;
 
 	while(1){
