@@ -38,8 +38,7 @@ sensor_msgs__msg__Imu imu_msg;
 rcl_publisher_t pitch_roll_publisher;
 geometry_msgs__msg__Vector3 vector3_msg;
 
-void timer_callback(rcl_timer_t * timer, int64_t last_call_time)
-{
+void timer_callback(rcl_timer_t * timer, int64_t last_call_time){
 	RCLC_UNUSED(last_call_time);
 	if (timer != NULL) {
 		int16_t ax, ay, az, gx, gy, gz, temp;
@@ -94,8 +93,7 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 	}
 }
 
-void micro_ros_task(void * arg)
-{
+void micro_ros_task(void * arg){
 	rcl_allocator_t allocator = rcl_get_default_allocator();
 	rclc_support_t support;
 

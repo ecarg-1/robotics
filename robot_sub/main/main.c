@@ -42,13 +42,21 @@
 #define LEDC_CHANNEL_L          LEDC_CHANNEL_0
 #define LEDC_CHANNEL_R          LEDC_CHANNEL_1
 #define LEDC_DUTY_RES           LEDC_TIMER_13_BIT // Set duty resolution to 13 bits
-#define LEDC_MAX_DUTY   		((1 << LEDC_DUTY_RES) - 1)
+#define LEDC_MAX_DUTY   		8192 //speed cap
+#define LEDC_MIN_DUTY   		5500 //min to have motors spin
 #define LEDC_CLK_SRC            LEDC_AUTO_CLK
 #define LEDC_FREQUENCY          (4000) // Frequency in Hertz. Set frequency at 4 kHz
 
 
 rcl_subscription_t robot_sub;
-geometry_msgs__msg__Vector3 vector3_msg;
+rcl_publisher_t robot_pub;
+geometry_msgs__msg__Vector3 vector3_sub;
+geometry_msgs__msg__Vector3 vector3_pub;
+float global_lf = 0.0f; 
+float global_rf = 0.0f;
+float global_lpwm = 0.0f;
+float global_rpwm = 0.0f;
+
 
 void init_ledc(void){
 	//left motor
@@ -91,30 +99,41 @@ void set_motors(int motor_num, float factor){
 	//clamping
 	if (factor >= 1.0f) factor = 1.0f;
 	if (factor <= -1.0f) factor = -1.0f;
-	//dead band
-	if (fabsf(factor) < .05f) factor = 0.0f;
+	
 	//setting direction and speed 
-	int32_t duty = fabsf(factor)*LEDC_MAX_DUTY;
-	if (motor_num == 1){ //right
+	int32_t duty = LEDC_MIN_DUTY + fabsf(factor)*(LEDC_MAX_DUTY-LEDC_MIN_DUTY);
+	if (fabsf(factor) < .2f) duty = 0.0f; //dead band
+	if (duty != 0.0f){
+		if (motor_num == 1){ //right
 		gpio_set_level(IN3, factor >= 0); 
 		gpio_set_level(IN4, factor < 0);
 		ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_R, duty);
 		ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_R);
+		global_rpwm = duty;
 		}
 	if (motor_num == 0){ //left
 		gpio_set_level(IN1, factor >= 0); 
 		gpio_set_level(IN2, factor < 0);
 		ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_L, duty);
 		ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_L);
+		global_lpwm = duty;
 		}
 	}
+	else { //stop motors
+		gpio_set_level(IN1, 0); 
+		gpio_set_level(IN2, 0);
+		gpio_set_level(IN3, 0); 
+		gpio_set_level(IN4, 0);
+		global_lpwm = global_rpwm = duty;
 
+	}
 	
-void robot_callback(const void * msgin)
-{
-	const geometry_msgs__msg__Vector3 * vector3_msg = (const geometry_msgs__msg__Vector3 *)msgin;
-	float pitch = vector3_msg->x;
-	float roll = vector3_msg->y;
+}
+
+void robot_callback(const void * msgin){
+	const geometry_msgs__msg__Vector3 * vector3_sub = (const geometry_msgs__msg__Vector3 *)msgin;
+	float pitch = vector3_sub->x;
+	float roll = vector3_sub->y;
 
 	//clamping
 	if (pitch >= 1.0f) pitch = 1.0f;
@@ -122,17 +141,35 @@ void robot_callback(const void * msgin)
 	if (roll >= 1.0f) roll = 1.0f;
 	if (roll <= -1.0f) roll = -1.0f;
 
+	//dead band
+	if (fabsf(pitch) < .15) pitch = 0.0f;
+	if (fabsf(roll) < .2) roll = 0.0f;
+
 	//factors for the math
-	float gain_p = .5;
-	float gain_r = .3; 
+	float gain_p = 1.0f;
+	float gain_r = 0.8f; 
 
 	float wheel_r = pitch*gain_p + roll*gain_r;
 	float wheel_l = pitch*gain_p - roll*gain_r;
 
+	global_lf = wheel_l;
+	global_rf = wheel_r;
+
 	set_motors(0, wheel_l);
 	set_motors(1, wheel_r);
+}
 
-
+void timer_callback(rcl_timer_t * timer, int64_t last_call_time)
+{
+	RCLC_UNUSED(last_call_time);
+	if (timer != NULL) {
+		
+		vector3_pub.x =  global_lf;
+		vector3_pub.y =  global_lpwm;
+		vector3_pub.z  =  global_rf;
+		//  =  global_rpwm;
+		RCSOFTCHECK(rcl_publish(&robot_pub, &vector3_pub, NULL));
+	}
 }
 
 void micro_ros_task(void * arg)
@@ -156,7 +193,7 @@ void micro_ros_task(void * arg)
 
 	// Create node.
 	rcl_node_t node = rcl_get_zero_initialized_node();
-	RCCHECK(rclc_node_init_default(&node, "led_subscriber", "", &support));
+	RCCHECK(rclc_node_init_default(&node, "robot_node", "", &support));
 
 	// Create subscriber.
 	RCCHECK(rclc_subscription_init_default(
@@ -165,23 +202,44 @@ void micro_ros_task(void * arg)
 		ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Vector3),
 		"/pitch_roll"));
 
+	//create publisher
+	RCCHECK(rclc_publisher_init_default(
+		&robot_pub,
+		&node,
+		ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Vector3),
+		"/wheel_speeds"));
+
 	// Create executor.
 	rclc_executor_t executor = rclc_executor_get_zero_initialized_executor();
 	RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
 	unsigned int rcl_wait_timeout = 1000;   // in ms
 	RCCHECK(rclc_executor_set_timeout(&executor, RCL_MS_TO_NS(rcl_wait_timeout)));
+	
+	// create timer,
+	rcl_timer_t timer;
+	const unsigned int timer_timeout = 20;
+	RCCHECK(rclc_timer_init_default(
+		&timer,
+		&support,
+		RCL_MS_TO_NS(timer_timeout),
+		timer_callback));
 
 	// Add timer and subscriber to executor.
-	RCCHECK(rclc_executor_add_subscription(&executor, &robot_sub, &vector3_msg, &robot_callback, ON_NEW_DATA));
+	geometry_msgs__msg__Vector3__init(&vector3_sub);
+	geometry_msgs__msg__Vector3__init(&vector3_pub);
+	RCCHECK(rclc_executor_add_subscription(&executor, &robot_sub, &vector3_sub, &robot_callback, ON_NEW_DATA));
+	RCCHECK(rclc_executor_add_timer(&executor, &timer));
+
+	
 
 	// Spin forever.
 	while(1){
 		rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
-		usleep(100000);
 	}
 
 	// Free resources.
 	RCCHECK(rcl_subscription_fini(&robot_sub, &node));
+	RCCHECK(rcl_publisher_fini(&robot_pub, &node));
 	RCCHECK(rcl_node_fini(&node));
 
   	vTaskDelete(NULL);
